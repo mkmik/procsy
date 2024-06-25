@@ -1,0 +1,126 @@
+#!/bin/bash
+
+set -euo pipefail
+
+DEFAULT_LISTEN=":8000"
+DEFAULT_START_PORT="8001"
+DEFAULT_PORT_ENV="PORT"
+
+DEFAULT_CUDA_VISIBLE_DEVICES_BASE="0"
+DEFAULT_CUDA_VISIBLE_DEVICES_SPAN="1"
+
+usage() {
+    echo "$0 command [argument ...]"
+    echo
+    echo "Start command and argument N times in parallel, passing a unique port number to each subprocess"
+    echo "and load balance the incoming requests on a common port."
+    echo ""
+    echo "Parameters to $0 are passed via env vars:"
+    echo "    PROCSY_N:             the number of parallel invocations of command"
+    echo "    PROCSY_LISTEN:        listen address of the reverse proxy (defaults to $DEFAULT_LISTEN)"
+    echo "    PROCSY_START_PORT:    start port number of child processes (defaults to $DEFAULT_START_PORT)"
+    echo "    PROCSY_PORT_ENV:      environment variable for the child port (defaults to $DEFAULT_PORT_ENV)"
+    echo "    PROCSY_PORT_TEMPLATE: template for the CLI argument added to the child process invocation contain the port (no default)"
+    echo ""
+    echo "Special CUDA GPU distribution support:"
+    echo "    PROCSY_CUDA_VISIBLE_DEVICES_BASE: base gpu number (defaults to $DEFAULT_CUDA_VISIBLE_DEVICES_BASE)"
+    echo "    PROCSY_CUDA_VISIBLE_DEVICES_SPAN: how many gpus each chiuld gets (defaults to $DEFAULT_CUDA_VISIBLE_DEVICES_SPAN)"
+    echo ""
+    echo "Example:"
+    echo ""
+    echo $'    env \\'
+    echo $'      PROCSY_N=4 \\'
+    echo $'      PROCSY_PORT_TEMPLATE=\'--port $PORT\' \\'
+    echo $'      PROCSY_CUDA_VISIBLE_DEVICES_SPAN=2 \\'
+    echo $'    procsy python3 -m vllm.entrypoints.openai.api_server \\'
+    echo $'      --model mistralai/Mixtral-8x7B-Instruct-v0.1 \\'
+    echo $'      --tensor-parallel-size 2 \\'
+    echo $'      --download-dir /scratch/hf_cache/'
+    exit 1
+}
+
+# shellcheck disable=SC2317
+KillJobs() {
+    for job in $(jobs -p); do
+            kill -s SIGTERM "${job}" > /dev/null 2>&1 || (sleep 10 && kill -9 "${job}" > /dev/null 2>&1 &)
+    done
+}
+
+TrapQuit() {
+    KillJobs
+}
+
+trap TrapQuit EXIT SIGINT SIGTERM
+
+CADDY="caddy"
+
+ensure_caddy_exists() {
+    if ! command -v "${CADDY}" &> /dev/null; then
+        CADDY="${TMPDIR:-/tmp}/procsy-caddy"
+        if [ ! -e "${CADDY}" ]; then
+            curl -sLf https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz \
+              | tar -xzOf - caddy > "${CADDY}"
+            chmod +x "${CADDY}"
+        fi
+    fi
+}
+
+run() {
+    local i="$1"
+    shift
+
+    local port="${PROCSY_START_PORT:-$DEFAULT_START_PORT}"
+    port=$((port + i - 1))
+    local port_template=${PROCSY_PORT_TEMPLATE:-}
+    local port_arg=${port_template/\$PORT/$port}
+
+    while true; do
+        echo "Running ${i}: ${*}"
+
+        local cuda_base="${PROCSY_CUDA_VISIBLE_DEVICES_BASE:-$DEFAULT_CUDA_VISIBLE_DEVICES_BASE}"
+        local cuda_span="${PROCSY_CUDA_VISIBLE_DEVICES_SPAN:-$DEFAULT_CUDA_VISIBLE_DEVICES_SPAN}"
+        local cuda_low=$((cuda_base + cuda_span*(i-1)))
+        local cuda_hi=$((cuda_base + cuda_span*i - 1))
+
+        # shellcheck disable=SC2086
+        env \
+          "${PROCSY_PORT_ENV:-$DEFAULT_PORT_ENV}"="${port}" \
+          CUDA_VISIBLE_DEVICES="$(seq "${cuda_low}" "${cuda_hi}" | tr '\n' ',' | sed 's/,$//')" \
+          "${@}" ${port_arg}
+        echo "Exited ${i}, restarting after 10s"
+        sleep 10
+    done
+}
+
+render_to() {
+    local port="${PROCSY_START_PORT:-$DEFAULT_START_PORT}"
+
+    for i in $(seq 1 "${PROCSY_N:-1}"); do
+        echo -n "--to localhost:$((port + i - 1)) "
+    done
+}
+
+main() {
+    ensure_caddy_exists
+
+    local targets
+    targets=$(render_to)
+
+    for n in $(seq 1 "${PROCSY_N:-1}"); do
+        echo "Running $n"
+        run "${n}" "${@}" &
+    done
+
+    # shellcheck disable=SC2086
+    "${CADDY}" reverse-proxy --from "${PROCSY_LISTEN:-$DEFAULT_LISTEN}" ${targets} &
+
+    wait
+}
+
+if [ -z "$*" ]; then
+    usage
+elif [ "$*" == "--help" ]; then
+    usage
+fi
+
+main "${@}"
