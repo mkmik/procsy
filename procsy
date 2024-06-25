@@ -34,8 +34,7 @@ usage() {
     echo $'      PROCSY_CUDA_VISIBLE_DEVICES_SPAN=2 \\'
     echo $'    procsy python3 -m vllm.entrypoints.openai.api_server \\'
     echo $'      --model mistralai/Mixtral-8x7B-Instruct-v0.1 \\'
-    echo $'      --tensor-parallel-size 2 \\'
-    echo $'      --download-dir /scratch/hf_cache/'
+    echo $'      --tensor-parallel-size 2'
     exit 1
 }
 

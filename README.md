@@ -22,7 +22,6 @@ env \
     PROCSY_CUDA_VISIBLE_DEVICES_SPAN=2 \
 procsy python3 -m vllm.entrypoints.openai.api_server \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
-    --tensor-parallel-size 2 \
-    --download-dir /scratch/hf_cache/
+    --tensor-parallel-size 2
 ```
 
